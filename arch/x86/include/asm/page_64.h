@@ -49,7 +49,9 @@ static inline unsigned long __phys_addr_symbol(unsigned long x)
 #define __phys_reloc_hide(x)	(x)
 
 void __clear_pages_unrolled(void *page);
+#ifndef MODULE
 KCFI_REFERENCE(__clear_pages_unrolled);
+#endif
 
 /**
  * clear_pages() - clear a page range using a kernel virtual address.
