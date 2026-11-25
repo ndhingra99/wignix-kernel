@@ -559,6 +559,7 @@ enum {
 	CS4208_MBP11,
 	CS4208_MACMINI,
 	CS4208_GPIO0,
+	CS4208_MACPRO61,
 };
 
 static const struct hda_model_fixup cs4208_models[] = {
@@ -566,6 +567,7 @@ static const struct hda_model_fixup cs4208_models[] = {
 	{ .id = CS4208_MBA6, .name = "mba6" },
 	{ .id = CS4208_MBP11, .name = "mbp11" },
 	{ .id = CS4208_MACMINI, .name = "macmini" },
+	{ .id = CS4208_MACPRO61, .name = "macpro61" },
 	{}
 };
 
@@ -581,7 +583,7 @@ static const struct hda_quirk cs4208_mac_fixup_tbl[] = {
 	SND_PCI_QUIRK(0x106b, 0x6c00, "MacMini 7,1", CS4208_MACMINI),
 	SND_PCI_QUIRK(0x106b, 0x7100, "MacBookAir 6,1", CS4208_MBA6),
 	SND_PCI_QUIRK(0x106b, 0x7200, "MacBookAir 6,2", CS4208_MBA6),
-	SND_PCI_QUIRK(0x106b, 0x7800, "MacPro 6,1", CS4208_MACMINI),
+	SND_PCI_QUIRK(0x106b, 0x7800, "MacPro 6,1", CS4208_MACPRO61),
 	SND_PCI_QUIRK(0x106b, 0x7b00, "MacBookPro 12,1", CS4208_MBP11),
 	SND_PCI_QUIRK(0x106b, 0x7f00, "iMac 16,1", CS4208_MBP11),
 	SND_PCI_QUIRK(0x8086, 0x7270, "MacBookAir 7,2", CS4208_MBA6),
@@ -596,6 +598,19 @@ static void cs4208_fixup_gpio0(struct hda_codec *codec,
 
 		spec->gpio_eapd_hp = 0;
 		spec->gpio_eapd_speaker = 1;
+		spec->gpio_mask = spec->gpio_dir =
+			spec->gpio_eapd_hp | spec->gpio_eapd_speaker;
+	}
+}
+
+/* Mac Pro 6,1: GPIO0 drives the speaker amplifier, GPIO1 the headphone one */
+static void cs4208_fixup_macpro61(struct hda_codec *codec,
+				  const struct hda_fixup *fix, int action)
+{
+	if (action == HDA_FIXUP_ACT_PRE_PROBE) {
+		struct cs_spec *spec = codec->spec;
+		spec->gpio_eapd_hp = 2; /* GPIO1 = headphones */
+		spec->gpio_eapd_speaker = 1; /* GPIO0 = speaker */
 		spec->gpio_mask = spec->gpio_dir =
 			spec->gpio_eapd_hp | spec->gpio_eapd_speaker;
 	}
@@ -683,6 +698,10 @@ static const struct hda_fixup cs4208_fixups[] = {
 		.v.func = cs4208_fixup_macmini,
 		.chained = true,
 		.chain_id = CS4208_GPIO0,
+	},
+	[CS4208_MACPRO61] = {
+		.type = HDA_FIXUP_FUNC,
+		.v.func = cs4208_fixup_macpro61,
 	},
 	[CS4208_GPIO0] = {
 		.type = HDA_FIXUP_FUNC,
