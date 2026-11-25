@@ -4236,11 +4236,13 @@ static void si_program_display_gap(struct amdgpu_device *adev)
 		WREG32(DCCG_DISP_SLOW_SELECT_REG, tmp);
 	}
 
-	/* Setting this to false forces the performance state to low if the crtcs are disabled.
-	 * This can be a problem on PowerXpress systems or if you want to use the card
-	 * for offscreen rendering or compute if there are no crtcs enabled.
+	/* The SMC holds the lowest performance level while it believes no
+	 * display is active, which pins a headless card (x11vnc, offscreen
+	 * rendering, compute) at its boot clocks. It is always told a display
+	 * is present; the display gap above already ignores the CRTCs when
+	 * none is enabled.
 	 */
-	si_notify_smc_display_change(adev, cfg->num_display > 0);
+	si_notify_smc_display_change(adev, true);
 }
 
 static void si_enable_spread_spectrum(struct amdgpu_device *adev, bool enable)
