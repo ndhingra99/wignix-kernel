@@ -41,6 +41,32 @@
 #include <linux/firmware.h>
 #include <legacy_dpm.h>
 
+/*
+ * Optional user caps for SI parts. All three default to 0, which keeps the
+ * VBIOS values. Clocks are in MHz, the throttle point is in degrees C.
+ */
+static int si_max_sclk;
+module_param_named(si_max_sclk, si_max_sclk, int, 0444);
+MODULE_PARM_DESC(si_max_sclk, "SI: cap engine clock in MHz (0 = VBIOS default)");
+
+static int si_max_mclk;
+module_param_named(si_max_mclk, si_max_mclk, int, 0444);
+MODULE_PARM_DESC(si_max_mclk, "SI: cap memory clock in MHz (0 = VBIOS default)");
+
+static int si_thermal_max;
+module_param_named(si_thermal_max, si_thermal_max, int, 0444);
+MODULE_PARM_DESC(si_thermal_max, "SI: DPM thermal throttle point in degrees C (0 = VBIOS default, 120)");
+
+static int si_user_temp_max(void)
+{
+	return si_thermal_max > 0 ? si_thermal_max * 1000 : R600_TEMP_RANGE_MAX;
+}
+
+static int si_user_temp_min(void)
+{
+	return si_thermal_max > 0 ? (si_thermal_max - 10) * 1000 : R600_TEMP_RANGE_MIN;
+}
+
 #include "bif/bif_3_0_d.h"
 #include "bif/bif_3_0_sh_mask.h"
 
@@ -3492,6 +3518,12 @@ static void si_apply_state_adjust_rules(struct amdgpu_device *adev,
 		}
 	}
 
+	/* User caps override the per-SKU quirks above. Clocks are in 10 kHz units. */
+	if (si_max_sclk > 0)
+		max_sclk = si_max_sclk * 100;
+	if (si_max_mclk > 0)
+		max_mclk = si_max_mclk * 100;
+
 	/* We define "high pixelclock" for SI as higher than necessary for 4K 30Hz.
 	 * For example, 4K 60Hz and 1080p 144Hz fall into this category.
 	 * Find number of such displays connected.
@@ -6834,7 +6866,7 @@ static int si_thermal_start_thermal_controller(struct amdgpu_device *adev)
 	int ret;
 
 	si_thermal_initialize(adev);
-	ret = si_thermal_set_temperature_range(adev, R600_TEMP_RANGE_MIN, R600_TEMP_RANGE_MAX);
+	ret = si_thermal_set_temperature_range(adev, si_user_temp_min(), si_user_temp_max());
 	if (ret)
 		return ret;
 	ret = si_thermal_enable_alert(adev, true);
@@ -6989,7 +7021,7 @@ static int si_set_temperature_range(struct amdgpu_device *adev)
 	ret = si_thermal_enable_alert(adev, false);
 	if (ret)
 		return ret;
-	ret = si_thermal_set_temperature_range(adev, R600_TEMP_RANGE_MIN, R600_TEMP_RANGE_MAX);
+	ret = si_thermal_set_temperature_range(adev, si_user_temp_min(), si_user_temp_max());
 	if (ret)
 		return ret;
 	ret = si_thermal_enable_alert(adev, true);
