@@ -75,7 +75,8 @@ nvkm_memx_fini(struct nvkm_memx **pmemx, bool exec)
 	struct nvkm_pmu *pmu = memx->pmu;
 	struct nvkm_subdev *subdev = &pmu->subdev;
 	struct nvkm_device *device = subdev->device;
-	u32 finish, reply[2];
+	u32 finish, reply[2] = {};
+	int ret = 0;
 
 	/* flush the cache... */
 	memx_out(memx);
@@ -86,14 +87,14 @@ nvkm_memx_fini(struct nvkm_memx **pmemx, bool exec)
 
 	/* call MEMX process to execute the script, and wait for reply */
 	if (exec) {
-		nvkm_pmu_send(pmu, reply, PROC_MEMX, MEMX_MSG_EXEC,
-			      memx->base, finish);
+		ret = nvkm_pmu_send(pmu, reply, PROC_MEMX, MEMX_MSG_EXEC,
+				    memx->base, finish);
 		nvkm_debug(subdev, "Exec took %uns, PMU_IN %08x\n",
 			   reply[0], reply[1]);
 	}
 
 	kfree(memx);
-	return 0;
+	return ret;
 }
 
 void

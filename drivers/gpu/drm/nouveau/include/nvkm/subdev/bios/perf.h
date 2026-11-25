@@ -27,6 +27,7 @@ struct nvbios_perfS {
 	union {
 		struct {
 			u32 freq;
+			u8  flags;
 		} v40;
 	};
 };

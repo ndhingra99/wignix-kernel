@@ -56,6 +56,10 @@ struct nvkm_cstate {
 	struct list_head head;
 	u8  voltage;
 	u32 domain[nv_clk_src_max];
+	/* Clock source the VBIOS asks for per domain (perf table v4.0, bits
+	 * 14-15 of the frequency word): 1 = PLL, 2 = divider, 0 = unspecified.
+	 */
+	u8  source[nv_clk_src_max];
 	u8  id;
 };
 
@@ -102,6 +106,16 @@ struct nvkm_clk {
 	u8  temp;
 
 	bool allow_reclock;
+	/* Raise voltage and engine clocks before memory when going up a
+	 * level, and lower memory before them when going down.
+	 */
+	bool core_first;
+	/* Without a user request, run the highest level on mains power
+	 * and the one below it on battery.  Memory is taken to the
+	 * highest level's clock once and stays there; only the engine
+	 * clocks and the voltage follow the power source.
+	 */
+	bool pwrsrc_levels;
 #define NVKM_CLK_BOOST_NONE 0x0
 #define NVKM_CLK_BOOST_BIOS 0x1
 #define NVKM_CLK_BOOST_FULL 0x2

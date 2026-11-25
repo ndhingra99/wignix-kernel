@@ -28,6 +28,7 @@
 #include <core/client.h>
 #include <core/firmware.h>
 #include <core/option.h>
+#include <core/w520.h>
 #include <subdev/acr.h>
 #include <subdev/fb.h>
 #include <subdev/mc.h>
@@ -342,8 +343,16 @@ gf100_gr_chan_bind(struct nvkm_object *object, struct nvkm_gpuobj *parent,
 		nvkm_wo32(*pgpuobj, 0x10, chan->mmio_nr / 2);
 		nvkm_wo32(*pgpuobj, 0x14, lower_32_bits(chan->mmio_vma->addr));
 		nvkm_wo32(*pgpuobj, 0x18, upper_32_bits(chan->mmio_vma->addr));
-		nvkm_wo32(*pgpuobj, 0x1c, 1);
-		nvkm_wo32(*pgpuobj, 0x20, 0);
+		/* ZCULL context switching: 1 = not switched, 2 = saved to
+		 * and restored from a per-channel buffer.
+		 */
+		if (chan->zcull_vma) {
+			nvkm_wo32(*pgpuobj, 0x1c, 2);
+			nvkm_wo32(*pgpuobj, 0x20, chan->zcull_vma->addr >> 8);
+		} else {
+			nvkm_wo32(*pgpuobj, 0x1c, 1);
+			nvkm_wo32(*pgpuobj, 0x20, 0);
+		}
 		nvkm_wo32(*pgpuobj, 0x28, 0);
 		nvkm_wo32(*pgpuobj, 0x2c, 0);
 	}
@@ -358,6 +367,8 @@ gf100_gr_chan_dtor(struct nvkm_object *object)
 
 	nvkm_vmm_put(chan->vmm, &chan->mmio_vma);
 	nvkm_memory_unref(&chan->mmio);
+	nvkm_vmm_put(chan->vmm, &chan->zcull_vma);
+	nvkm_memory_unref(&chan->zcull);
 
 	nvkm_vmm_put(chan->vmm, &chan->attrib_cb);
 	nvkm_vmm_put(chan->vmm, &chan->unknown);
@@ -466,6 +477,31 @@ gf100_gr_chan_new(struct nvkm_gr *base, struct nvkm_chan *fifoch,
 			      chan->mmio_vma, &args, sizeof(args));
 	if (ret)
 		return ret;
+
+	/* With NVIDIA's context-switch firmware, give the channel a buffer
+	 * for its ZCULL RAM contents so two channels that both use ZCULL do
+	 * not see each other's data.  nouveau's own firmware does not save
+	 * ZCULL.  On by default on the W520; nouveau.config=NvGrZcullCtxsw=0
+	 * turns it off, =1 turns it on elsewhere.
+	 */
+	if (gr->firmware && gr->size_zcull &&
+	    nvkm_boolopt(device->cfgopt, "NvGrZcullCtxsw", nvkm_w520(device))) {
+		ret = nvkm_memory_new(device, NVKM_MEM_TARGET_INST,
+				      ALIGN(gr->size_zcull, 0x1000), 0x1000,
+				      true, &chan->zcull);
+		if (ret)
+			return ret;
+
+		ret = nvkm_vmm_get(fifoch->vmm, 12, nvkm_memory_size(chan->zcull),
+				   &chan->zcull_vma);
+		if (ret)
+			return ret;
+
+		ret = nvkm_memory_map(chan->zcull, 0, fifoch->vmm,
+				      chan->zcull_vma, &args, sizeof(args));
+		if (ret)
+			return ret;
+	}
 
 	/* finally, fill in the mmio list and point the context at it */
 	nvkm_kmap(chan->mmio);
@@ -2567,7 +2603,7 @@ gf100_gr_nofw(struct gf100_gr *gr, int ver, const struct gf100_gr_fwif *fwif)
 
 static int
 gf100_gr_load_fw(struct gf100_gr *gr, const char *name,
-		 struct nvkm_blob *blob)
+		 struct nvkm_blob *blob, bool quiet)
 {
 	struct nvkm_subdev *subdev = &gr->base.engine.subdev;
 	struct nvkm_device *device = subdev->device;
@@ -2576,13 +2612,20 @@ gf100_gr_load_fw(struct gf100_gr *gr, const char *name,
 	int ret;
 
 	snprintf(f, sizeof(f), "nouveau/nv%02x_%s", device->chipset, name);
-	ret = request_firmware(&fw, f, device->dev);
-	if (ret) {
-		snprintf(f, sizeof(f), "nouveau/%s", name);
+	if (quiet) {
+		/* Not asked for by the user: absent files are not an error. */
+		ret = firmware_request_nowarn(&fw, f, device->dev);
+		if (ret)
+			return ret;
+	} else {
 		ret = request_firmware(&fw, f, device->dev);
 		if (ret) {
-			nvkm_error(subdev, "failed to load %s\n", name);
-			return ret;
+			snprintf(f, sizeof(f), "nouveau/%s", name);
+			ret = request_firmware(&fw, f, device->dev);
+			if (ret) {
+				nvkm_error(subdev, "failed to load %s\n", name);
+				return ret;
+			}
 		}
 	}
 
@@ -2596,19 +2639,39 @@ int
 gf100_gr_load(struct gf100_gr *gr, int ver, const struct gf100_gr_fwif *fwif)
 {
 	struct nvkm_device *device = gr->base.engine.subdev.device;
+	/* The W520 uses NVIDIA's context-switch firmware when it is
+	 * installed (it saves ZCULL state per channel, nouveau's does not)
+	 * and nouveau's own otherwise.
+	 */
+	int arglen;
+	const bool quiet = nvkm_w520(device) &&
+			   !nvkm_stropt(device->cfgopt, "NvGrUseFW", &arglen);
 
-	if (!nvkm_boolopt(device->cfgopt, "NvGrUseFW", false))
+	if (!nvkm_boolopt(device->cfgopt, "NvGrUseFW", nvkm_w520(device)))
 		return -EINVAL;
 
-	if (gf100_gr_load_fw(gr, "fuc409c", &gr->fecs.inst) ||
-	    gf100_gr_load_fw(gr, "fuc409d", &gr->fecs.data) ||
-	    gf100_gr_load_fw(gr, "fuc41ac", &gr->gpccs.inst) ||
-	    gf100_gr_load_fw(gr, "fuc41ad", &gr->gpccs.data))
+	if (gf100_gr_load_fw(gr, "fuc409c", &gr->fecs.inst, quiet) ||
+	    gf100_gr_load_fw(gr, "fuc409d", &gr->fecs.data, quiet) ||
+	    gf100_gr_load_fw(gr, "fuc41ac", &gr->gpccs.inst, quiet) ||
+	    gf100_gr_load_fw(gr, "fuc41ad", &gr->gpccs.data, quiet)) {
+		nvkm_blob_dtor(&gr->fecs.inst);
+		nvkm_blob_dtor(&gr->fecs.data);
+		nvkm_blob_dtor(&gr->gpccs.inst);
+		nvkm_blob_dtor(&gr->gpccs.data);
 		return -ENOENT;
+	}
 
+	nvkm_info(&gr->base.engine.subdev,
+		  "using NVIDIA context-switch firmware\n");
 	gr->firmware = true;
 	return 0;
 }
+
+/* So the initramfs generator picks them up when they are installed. */
+MODULE_FIRMWARE("nouveau/nvc3_fuc409c");
+MODULE_FIRMWARE("nouveau/nvc3_fuc409d");
+MODULE_FIRMWARE("nouveau/nvc3_fuc41ac");
+MODULE_FIRMWARE("nouveau/nvc3_fuc41ad");
 
 static const struct gf100_gr_fwif
 gf100_gr_fwif[] = {

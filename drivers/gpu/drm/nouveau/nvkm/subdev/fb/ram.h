@@ -15,6 +15,15 @@ extern const struct nvkm_ram_func nv04_ram_func;
 int  nv50_ram_ctor(const struct nvkm_ram_func *, struct nvkm_fb *,
 		   struct nvkm_ram *);
 
+/* ramw520.c */
+struct w520_ram;
+struct nvbios_pll;
+int w520_ram_new(struct nvkm_ram *, const struct nvbios_pll *refpll,
+		 const struct nvbios_pll *mempll, struct w520_ram **);
+int w520_ram_calc(struct w520_ram *, u32 freq, u8 source);
+int w520_ram_prog(struct w520_ram *);
+void w520_ram_tidy(struct w520_ram *);
+
 int gf100_ram_new_(const struct nvkm_ram_func *, struct nvkm_fb *,
 		   struct nvkm_ram **);
 int  gf100_ram_ctor(const struct nvkm_ram_func *, struct nvkm_fb *,

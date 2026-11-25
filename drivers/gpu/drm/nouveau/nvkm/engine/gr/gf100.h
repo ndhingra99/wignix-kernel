@@ -287,6 +287,12 @@ struct gf100_gr_chan {
 
 	struct nvkm_memory *mmio;
 	struct nvkm_vma *mmio_vma;
+
+	/* ZCULL save area the context-switch firmware uses for this
+	 * channel (NVIDIA firmware only).
+	 */
+	struct nvkm_memory *zcull;
+	struct nvkm_vma *zcull_vma;
 	int mmio_nr;
 };
 

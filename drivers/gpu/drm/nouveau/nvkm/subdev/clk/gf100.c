@@ -25,6 +25,7 @@
 #include "priv.h"
 #include "pll.h"
 
+#include <core/w520.h>
 #include <subdev/bios.h>
 #include <subdev/bios/pll.h>
 #include <subdev/timer.h>
@@ -38,9 +39,25 @@ struct gf100_clk_info {
 	u32 coef;
 };
 
+/* Target state of one clock node on the W520 path. */
+struct w520_clk_node {
+	bool used;
+	bool pll;	/* run from the PLL input of the node's mux */
+	bool main;	/* (re)program the source and main divider */
+	u32 dsrc;
+	u32 ddiv;
+	u32 coef;	/* PLL coefficients to program, 0 = leave the PLL alone */
+	u32 post;	/* post divider field (divide by (post + 2) / 2) */
+	u32 freq;
+};
+
 struct gf100_clk {
 	struct nvkm_clk base;
 	struct gf100_clk_info eng[16];
+
+	bool w520;
+	struct w520_clk_node node[16];
+	bool up;
 };
 
 static u32 read_div(struct gf100_clk *, int, u32, u32);
@@ -53,6 +70,29 @@ read_vco(struct gf100_clk *clk, u32 dsrc)
 	if (!(ssrc & 0x00000100))
 		return nvkm_clk_read(&clk->base, nv_clk_src_sppll0);
 	return nvkm_clk_read(&clk->base, nv_clk_src_sppll1);
+}
+
+/* Reference clock of the PLL of node idx, with its source divider applied.
+ * read_div() only does that for nodes 0-2.
+ */
+static u32
+w520_pll_ref(struct gf100_clk *clk, int idx)
+{
+	struct nvkm_device *device = clk->base.subdev.device;
+	u32 ssrc = nvkm_rd32(device, 0x137120 + (idx * 4));
+	u32 sctl, sdiv = 2;
+
+	if ((ssrc & 0x00000003) != 3)
+		return read_div(clk, idx, 0x137120, 0x137140);
+
+	sctl = nvkm_rd32(device, 0x137140 + (idx * 4));
+	if (sctl & 0x80000000) {
+		if (ssrc & 0x100)
+			sctl >>= 8;
+		sdiv = (sctl & 0x3f) + 2;
+	}
+
+	return (read_vco(clk, 0x137120 + (idx * 4)) * 2) / sdiv;
 }
 
 static u32
@@ -86,10 +126,15 @@ read_pll(struct gf100_clk *clk, u32 pll)
 	case 0x137040:
 	case 0x1370e0:
 		sclk = read_div(clk, (pll & 0xff) / 0x20, 0x137120, 0x137140);
+		if (clk->w520)
+			sclk = w520_pll_ref(clk, (pll & 0xff) / 0x20);
 		break;
 	default:
 		return 0;
 	}
+
+	if (!M || !P)
+		return 0;
 
 	return sclk * N / M / P;
 }
@@ -182,6 +227,23 @@ gf100_clk_read(struct nvkm_clk *base, enum nv_clk_src src)
 	case nv_clk_src_mem:
 		if (nvkm_rd32(device, 0x1373f0) & 0x00000002)
 			return nvkm_clk_read(&clk->base, nv_clk_src_mpll);
+		/* DDR3 on the W520 selects MPLL with 0x137360 instead. */
+		if (clk->w520 && !(nvkm_rd32(device, 0x137360) & 0x00000001) &&
+		    (nvkm_rd32(device, 0x132000) & 0x00000001)) {
+			u32 ref = read_div(clk, 0, 0x137320, 0x137330);
+			u32 rpll = nvkm_rd32(device, 0x10fe24);
+			u32 mpll = nvkm_rd32(device, 0x132004);
+			u32 M, P;
+
+			M = rpll & 0xff;
+			P = (rpll & 0x003f0000) >> 16;
+			if (M && P)
+				ref = ref * ((rpll & 0xff00) >> 8) / M / P;
+			M = mpll & 0xff;
+			P = (mpll & 0x003f0000) >> 16;
+			if (M && P)
+				return ref * ((mpll & 0xff00) >> 8) / M / P;
+		}
 		return nvkm_clk_read(&clk->base, nv_clk_src_mdiv);
 
 	case nv_clk_src_gpc:
@@ -321,11 +383,377 @@ calc_clk(struct gf100_clk *clk, struct nvkm_cstate *cstate, int idx, int dom)
 	return 0;
 }
 
+
+/******************************************************************************
+ * ThinkPad W520 (Quadro 2000M, GF106GLM)
+ *
+ * The generic code above picks whichever of the divider and the PLL lands
+ * closest to the VBIOS number and switches every node stage by stage.  That
+ * is not what this hardware wants:
+ *
+ *  - The VBIOS stores whole MHz (101 for 101.25) and says per node whether
+ *    it is meant to run from a divider or from a PLL.  Dividers of the
+ *    1620 MHz VCO are used wherever the VBIOS allows it; PLLs only where
+ *    it asks for one or no divider is close enough.
+ *  - The main divider of a node stays where the VBIOS put it when a post
+ *    divider alone reaches the target, so the low levels differ only in
+ *    the post divider and the mux does not move between them.
+ *  - The source mux and the post divider of GPC and of the hub clock
+ *    (hubk06) are only touched while PTHERM holds that domain's clock
+ *    slowed down.  Switching a busy GPC without it can wedge PGRAPH.
+ *  - The PLL lock test is left enabled after lock.
+ *  - The hub PLL and the PMU clock are left as the VBIOS set them.
+ *  - A mux that does not switch ends the transition.
+ *****************************************************************************/
+#define W520_PLL_NODES 0x00004387
+
+static bool
+w520_in_window(u32 khz, u32 target)
+{
+	return khz + 2000 >= target && khz <= target + 3000;
+}
+
+static u32
+w520_diff(u32 a, u32 b)
+{
+	return a > b ? a - b : b - a;
+}
+
+/* Closest post divider setting for ref -> freq; returns the result. */
+static u32
+w520_post(u32 ref, u32 freq, u32 *post)
+{
+	u32 div, best = 2, khz, err = ~0;
+
+	if (!ref || !freq) {
+		*post = 0;
+		return ref;
+	}
+
+	for (div = 2; div <= 65; div++) {
+		khz = (ref * 2) / div;
+		if (w520_diff(khz, freq) < err) {
+			err = w520_diff(khz, freq);
+			best = div;
+		}
+	}
+
+	*post = best - 2;
+	return (ref * 2) / best;
+}
+
+static int
+w520_clk_calc_node(struct gf100_clk *clk, struct nvkm_cstate *cstate,
+		   int idx, int dom)
+{
+	struct nvkm_subdev *subdev = &clk->base.subdev;
+	struct nvkm_device *device = subdev->device;
+	struct w520_clk_node *node = &clk->node[idx];
+	const u32 freq = cstate->domain[dom];
+	const u8 source = cstate->source[dom];
+	u32 dsrc = 0, ddiv = 0, dpost = 0, dkhz;
+	u32 coef = 0, ppost = 0, pkhz = 0;
+	bool main = false;
+
+	if (!freq)
+		return 0;
+
+	/* Divider path.  Fixed sources first, then the main divider as it
+	 * is programmed now, and only then a new main divider.
+	 */
+	if (freq == 27000 || freq == 108000 || freq == 100000) {
+		dkhz = calc_src(clk, idx, freq, &dsrc, &ddiv);
+		main = nvkm_rd32(device, 0x137160 + (idx * 4)) != dsrc;
+	} else {
+		u32 cur = read_div(clk, idx, 0x137160, 0x1371d0);
+
+		dkhz = w520_post(cur, freq, &dpost);
+		if (!w520_in_window(dkhz, freq) && idx < 7) {
+			u32 div, ref;
+
+			ref = calc_src(clk, idx, freq, &dsrc, &div);
+			ref = w520_post(ref, freq, &dpost);
+			if (w520_diff(ref, freq) < w520_diff(dkhz, freq)) {
+				dsrc |= nvkm_rd32(device, 0x137160 + (idx * 4)) &
+					0x00000100;
+				if (div)
+					ddiv = 0x80000000 | div << 8 | div;
+				dkhz = ref;
+				main = true;
+			}
+		}
+	}
+
+	/* PLL path. */
+	if (W520_PLL_NODES & BIT(idx)) {
+		if (idx <= 2) {
+			struct nvbios_pll limits;
+			int N, M, P, ret;
+
+			ret = nvbios_pll_parse(device->bios,
+					       0x137000 + (idx * 0x20), &limits);
+			if (ret == 0) {
+				limits.refclk = 405000;
+				ret = gt215_pll_calc(subdev, &limits, freq,
+						     &N, NULL, &M, &P);
+				if (ret > 0) {
+					coef = (P << 16) | (N << 8) | M;
+					pkhz = ret;
+				}
+			}
+		} else {
+			/* The hub PLL, as it runs. */
+			u32 hub = read_pll(clk, 0x1370e0);
+
+			if (hub)
+				pkhz = w520_post(hub, freq, &ppost);
+		}
+	}
+
+	node->used = true;
+	if (pkhz && (source == 1 ||
+		     (source != 2 && !w520_in_window(dkhz, freq) &&
+		      w520_diff(pkhz, freq) < w520_diff(dkhz, freq)))) {
+		node->pll = true;
+		node->coef = coef;
+		node->post = ppost;
+		node->freq = pkhz;
+	} else {
+		node->pll = false;
+		node->main = main;
+		node->dsrc = dsrc;
+		node->ddiv = ddiv;
+		node->post = dpost;
+		node->freq = dkhz;
+	}
+
+	nvkm_info(subdev, "W520 node %02x: %d kHz (vbios source %d) -> %s %d kHz "
+			   "main %d %08x/%08x coef %08x post %02x\n", idx,
+		   freq, source, node->pll ? "pll" : "div", node->freq,
+		   node->main, node->dsrc, node->ddiv, node->coef, node->post);
+	return 0;
+}
+
+static int
+w520_clk_calc(struct gf100_clk *clk, struct nvkm_cstate *cstate)
+{
+	u32 cur = read_clk(clk, 0x00);
+	int ret;
+
+	memset(clk->node, 0x00, sizeof(clk->node));
+	clk->up = cstate->domain[nv_clk_src_gpc] >= cur;
+
+	if ((ret = w520_clk_calc_node(clk, cstate, 0x00, nv_clk_src_gpc)) ||
+	    (ret = w520_clk_calc_node(clk, cstate, 0x01, nv_clk_src_rop)) ||
+	    (ret = w520_clk_calc_node(clk, cstate, 0x02, nv_clk_src_hubk07)) ||
+	    (ret = w520_clk_calc_node(clk, cstate, 0x07, nv_clk_src_hubk06)) ||
+	    (ret = w520_clk_calc_node(clk, cstate, 0x08, nv_clk_src_hubk01)) ||
+	    (ret = w520_clk_calc_node(clk, cstate, 0x09, nv_clk_src_copy)) ||
+	    (ret = w520_clk_calc_node(clk, cstate, 0x0e, nv_clk_src_vdec)))
+		return ret;
+
+	return 0;
+}
+
+struct w520_slowdown {
+	bool on;
+	int i;
+	u32 ctrl, r160, r180;
+};
+
+/* Engage the PTHERM clock slowdown of the GPC (node 0) or hub (node 7)
+ * domain, with the temperature-driven slowdowns masked, and give it time
+ * to take effect.
+ */
+static void
+w520_slowdown_enter(struct gf100_clk *clk, int idx, struct w520_slowdown *s)
+{
+	struct nvkm_subdev *subdev = &clk->base.subdev;
+	struct nvkm_device *device = subdev->device;
+	u32 code;
+
+	if (s->on || (idx != 0x00 && idx != 0x07))
+		return;
+
+	s->i = (idx == 0x00) ? 0 : 1;
+	code = (idx == 0x00) ? 0x0e : 0x02;
+	s->ctrl = nvkm_rd32(device, 0x020004);
+	s->r160 = nvkm_rd32(device, 0x020160 + (s->i * 4));
+	s->r180 = nvkm_rd32(device, 0x020180 + (s->i * 4));
+
+	nvkm_wr32(device, 0x020160 + (s->i * 4), code << 16 | 0x80 | code);
+	nvkm_wr32(device, 0x020180 + (s->i * 4), code);
+	nvkm_wr32(device, 0x020004, s->ctrl & ~0x000000ff);
+	s->on = true;
+
+	if (nvkm_usec(device, 200,
+		if ((nvkm_rd32(device, 0x0201e0 + (s->i * 4)) & 0x0002003f) ==
+		    (0x00020000 | code))
+			break;
+	) < 0)
+		nvkm_debug(subdev, "slowdown %d not reported (%08x)\n", s->i,
+			   nvkm_rd32(device, 0x0201e0 + (s->i * 4)));
+
+	udelay(200);
+}
+
+static void
+w520_slowdown_leave(struct gf100_clk *clk, struct w520_slowdown *s)
+{
+	struct nvkm_device *device = clk->base.subdev.device;
+
+	if (!s->on)
+		return;
+
+	nvkm_wr32(device, 0x020160 + (s->i * 4), s->r160);
+	nvkm_wr32(device, 0x020180 + (s->i * 4), s->r180);
+	nvkm_wr32(device, 0x020004, s->ctrl);
+	s->on = false;
+}
+
+static int
+w520_clk_mux(struct gf100_clk *clk, int idx, bool pll)
+{
+	struct nvkm_subdev *subdev = &clk->base.subdev;
+	struct nvkm_device *device = subdev->device;
+	const u32 want = pll ? BIT(idx) : 0;
+
+	nvkm_mask(device, 0x137100, BIT(idx), want);
+	if (nvkm_msec(device, 2000,
+		if ((nvkm_rd32(device, 0x137100) & BIT(idx)) == want)
+			break;
+	) < 0) {
+		nvkm_error(subdev, "node %02x: mux stuck (%08x)\n", idx,
+			   nvkm_rd32(device, 0x137100));
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
+static int
+w520_clk_prog_pll(struct gf100_clk *clk, int idx, u32 coef)
+{
+	struct nvkm_subdev *subdev = &clk->base.subdev;
+	struct nvkm_device *device = subdev->device;
+	const u32 addr = 0x137000 + (idx * 0x20);
+
+	/* 405 MHz reference: SPPLL1 through the reference divider. */
+	nvkm_wr32(device, 0x137140 + (idx * 4), 0x81200606);
+	nvkm_wr32(device, 0x137120 + (idx * 4), 0x00000103);
+
+	nvkm_mask(device, addr + 0x00, 0x00000004, 0x00000000);
+	nvkm_mask(device, addr + 0x00, 0x00000001, 0x00000000);
+	nvkm_wr32(device, addr + 0x04, coef);
+	nvkm_mask(device, addr + 0x00, 0x00000011, 0x00000001);
+	if (nvkm_msec(device, 2000,
+		if (nvkm_rd32(device, addr + 0x00) & 0x00020000)
+			break;
+	) < 0) {
+		nvkm_error(subdev, "node %02x: PLL not locked (%08x %08x)\n",
+			   idx, nvkm_rd32(device, addr + 0x00), coef);
+		return -EBUSY;
+	}
+	nvkm_mask(device, addr + 0x00, 0x00000004, 0x00000004);
+	return 0;
+}
+
+static int
+w520_clk_prog_node(struct gf100_clk *clk, int idx)
+{
+	struct nvkm_device *device = clk->base.subdev.device;
+	struct w520_clk_node *node = &clk->node[idx];
+	struct w520_slowdown slow = {};
+	const u32 post = 0x137250 + (idx * 4);
+	bool pll = nvkm_rd32(device, 0x137100) & BIT(idx);
+	int ret = 0;
+
+	if (!node->used)
+		return 0;
+
+	if (!node->pll) {
+		u32 cur = nvkm_rd32(device, post) & 0x0000003f;
+
+		/* The divider path is live unless the node sits on its PLL. */
+		if (!pll && (node->main || cur != node->post))
+			w520_slowdown_enter(clk, idx, &slow);
+
+		if (node->main) {
+			nvkm_mask(device, 0x1371d0 + (idx * 4), 0x80003f3f,
+				  node->ddiv);
+			nvkm_wr32(device, 0x137160 + (idx * 4), node->dsrc);
+		}
+		nvkm_mask(device, post, 0x8000003f, 0x80000000 | node->post);
+
+		if (pll) {
+			w520_slowdown_enter(clk, idx, &slow);
+			ret = w520_clk_mux(clk, idx, false);
+		}
+	} else {
+		const u32 addr = 0x137000 + (idx * 0x20);
+		u32 cur = nvkm_rd32(device, post) & 0x00003f00;
+
+		if (node->coef &&
+		    (nvkm_rd32(device, addr + 0x04) != node->coef ||
+		     !(nvkm_rd32(device, addr + 0x00) & 0x00000001))) {
+			w520_slowdown_enter(clk, idx, &slow);
+			if (pll) {
+				ret = w520_clk_mux(clk, idx, false);
+				pll = false;
+			}
+			if (ret == 0)
+				ret = w520_clk_prog_pll(clk, idx, node->coef);
+		}
+
+		if (ret == 0) {
+			if (pll && cur != node->post << 8)
+				w520_slowdown_enter(clk, idx, &slow);
+			nvkm_mask(device, post, 0x80003f00,
+				  0x80000000 | node->post << 8);
+			if (!pll) {
+				w520_slowdown_enter(clk, idx, &slow);
+				ret = w520_clk_mux(clk, idx, true);
+			}
+		}
+	}
+
+	w520_slowdown_leave(clk, &slow);
+	return ret;
+}
+
+static int
+w520_clk_prog(struct gf100_clk *clk)
+{
+	/* Hub clocks first on the way up and last on the way down. */
+	static const u8 order[] = { 0x07, 0x08, 0x09, 0x00, 0x01, 0x0e, 0x02 };
+	int i, ret;
+
+	/* Diagnosis: nouveau.config=NvW520EngExec=0 leaves engine clocks. */
+	if (!nvkm_boolopt(clk->base.subdev.device->cfgopt, "NvW520EngExec", true))
+		return 0;
+
+	/* The regulator gives no feedback; let a voltage change settle. */
+	usleep_range(200, 400);
+
+	for (i = 0; i < ARRAY_SIZE(order); i++) {
+		int idx = order[clk->up ? i : ARRAY_SIZE(order) - 1 - i];
+
+		ret = w520_clk_prog_node(clk, idx);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int
 gf100_clk_calc(struct nvkm_clk *base, struct nvkm_cstate *cstate)
 {
 	struct gf100_clk *clk = gf100_clk(base);
 	int ret;
+
+	if (clk->w520)
+		return w520_clk_calc(clk, cstate);
 
 	if ((ret = calc_clk(clk, cstate, 0x00, nv_clk_src_gpc)) ||
 	    (ret = calc_clk(clk, cstate, 0x01, nv_clk_src_rop)) ||
@@ -427,6 +855,9 @@ gf100_clk_prog(struct nvkm_clk *base)
 	};
 	int i, j;
 
+	if (clk->w520)
+		return w520_clk_prog(clk);
+
 	for (i = 0; i < ARRAY_SIZE(stage); i++) {
 		for (j = 0; j < ARRAY_SIZE(clk->eng); j++) {
 			if (!clk->eng[j].freq)
@@ -443,6 +874,59 @@ gf100_clk_tidy(struct nvkm_clk *base)
 {
 	struct gf100_clk *clk = gf100_clk(base);
 	memset(clk->eng, 0x00, sizeof(clk->eng));
+	memset(clk->node, 0x00, sizeof(clk->node));
+}
+
+/* What the VBIOS asks for per level, and the clock tree as it was left. */
+static void
+w520_clk_info(struct gf100_clk *clk)
+{
+	static const u8 nodes[] = { 0x00, 0x01, 0x02, 0x07, 0x08, 0x09, 0x0c, 0x0e };
+	static const u32 regs[] = {
+		0x137100, 0x00e800, 0x00e804, 0x00e820, 0x00e824, 0x1370e0,
+		0x1370e4, 0x020004, 0x020130, 0x020160, 0x020164, 0x020180,
+		0x020184, 0x0201a0, 0x0201a4, 0x0201e0, 0x0201e4, 0x022680,
+	};
+	struct nvkm_subdev *subdev = &clk->base.subdev;
+	struct nvkm_device *device = subdev->device;
+	const struct nvkm_domain *domain;
+	struct nvkm_pstate *pstate;
+	int i;
+
+	list_for_each_entry(pstate, &clk->base.states, head) {
+		for (domain = clk->base.domains;
+		     domain->name != nv_clk_src_max; domain++) {
+			if (domain->bios == 0xff)
+				continue;
+			nvkm_info(subdev, "W520 level %02x volt %02x dom %02x: "
+					  "%d kHz source %d\n", pstate->pstate,
+				  pstate->base.voltage, domain->bios,
+				  pstate->base.domain[domain->name],
+				  pstate->base.source[domain->name]);
+		}
+	}
+
+	for (i = 0; i < ARRAY_SIZE(nodes); i++) {
+		const int n = nodes[i];
+
+		nvkm_info(subdev, "W520 node %02x: src %08x div %08x post %08x "
+				  "pll %08x %08x ref %08x %08x = %d kHz\n", n,
+			  nvkm_rd32(device, 0x137160 + (n * 4)),
+			  n < 7 ? nvkm_rd32(device, 0x1371d0 + (n * 4)) : 0,
+			  nvkm_rd32(device, 0x137250 + (n * 4)),
+			  n < 7 ? nvkm_rd32(device, 0x137000 + (n * 0x20)) : 0,
+			  n < 7 ? nvkm_rd32(device, 0x137004 + (n * 0x20)) : 0,
+			  nvkm_rd32(device, 0x137120 + (n * 4)),
+			  nvkm_rd32(device, 0x137140 + (n * 4)),
+			  read_clk(clk, n));
+	}
+
+	for (i = 0; i + 2 < ARRAY_SIZE(regs); i += 3) {
+		nvkm_info(subdev, "W520 reg %06x %08x  %06x %08x  %06x %08x\n",
+			  regs[i + 0], nvkm_rd32(device, regs[i + 0]),
+			  regs[i + 1], nvkm_rd32(device, regs[i + 1]),
+			  regs[i + 2], nvkm_rd32(device, regs[i + 2]));
+	}
 }
 
 static const struct nvkm_clk_func
@@ -472,10 +956,17 @@ gf100_clk_new(struct nvkm_device *device, enum nvkm_subdev_type type, int inst,
 	      struct nvkm_clk **pclk)
 {
 	struct gf100_clk *clk;
+	int ret;
 
 	if (!(clk = kzalloc_obj(*clk)))
 		return -ENOMEM;
 	*pclk = &clk->base;
+	clk->w520 = nvkm_w520(device);
+	clk->base.core_first = clk->w520;
+	clk->base.pwrsrc_levels = clk->w520;
 
-	return nvkm_clk_ctor(&gf100_clk, device, type, inst, false, &clk->base);
+	ret = nvkm_clk_ctor(&gf100_clk, device, type, inst, clk->w520, &clk->base);
+	if (ret == 0 && clk->w520)
+		w520_clk_info(clk);
+	return ret;
 }

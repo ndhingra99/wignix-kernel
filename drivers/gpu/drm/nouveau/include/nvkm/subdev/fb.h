@@ -152,6 +152,10 @@ struct nvkm_ram {
 	int part_mask;
 
 	u32 freq;
+	/* Clock source the VBIOS asks for at the next frequency (see
+	 * nvkm_cstate.source).
+	 */
+	u8  source;
 	u32 mr[16];
 	u32 mr1_nuts;
 

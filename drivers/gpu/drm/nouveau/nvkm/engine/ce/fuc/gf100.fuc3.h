@@ -518,7 +518,7 @@ static uint32_t gf100_ce_code[] = {
 	0xf4003fc8,
 	0x21f50e0b,
 	0x47f101af,
-	0x0ef40200,
+	0x0ef40600,
 /* 0x04cd: cmd_exec_no_format */
 	0x1067f11e,
 	0x0664b608,

@@ -191,6 +191,7 @@ nvbios_perfSp(struct nvkm_bios *bios, u32 perfE, int idx,
 	switch (!!data * *ver) {
 	case 0x40:
 		info->v40.freq = (nvbios_rd16(bios, data + 0x00) & 0x3fff) * 1000;
+		info->v40.flags = nvbios_rd16(bios, data + 0x00) >> 14;
 		break;
 	default:
 		break;

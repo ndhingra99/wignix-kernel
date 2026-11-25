@@ -66,6 +66,7 @@
 #include "nouveau_abi16.h"
 #include "nouveau_fence.h"
 #include "nouveau_debugfs.h"
+#include "nouveau_w520.h"
 #include "nouveau_connector.h"
 #include "nouveau_platform.h"
 #include "nouveau_svm.h"
@@ -592,6 +593,7 @@ nouveau_drm_device_fini(struct nouveau_drm *drm)
 	nouveau_dmem_fini(drm);
 	nouveau_svm_fini(drm);
 	nouveau_hwmon_fini(dev);
+	nouveau_w520_fini(drm);
 	nouveau_debugfs_fini(drm);
 
 	if (dev->mode_config.num_crtc)
@@ -676,6 +678,7 @@ nouveau_drm_device_init(struct nouveau_drm *drm)
 	}
 
 	nouveau_debugfs_init(drm);
+	nouveau_w520_init(drm);
 	nouveau_hwmon_init(dev);
 	nouveau_svm_init(drm);
 	nouveau_dmem_init(drm);

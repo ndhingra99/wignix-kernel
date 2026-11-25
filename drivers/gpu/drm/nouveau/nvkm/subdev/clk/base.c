@@ -164,6 +164,7 @@ nvkm_cstate_prog(struct nvkm_clk *clk, struct nvkm_pstate *pstate, int cstatei)
 	struct nvkm_therm *therm = device->therm;
 	struct nvkm_volt *volt = device->volt;
 	struct nvkm_cstate *cstate;
+	u8 volt_id, volt_min;
 	int ret;
 
 	if (!list_empty(&pstate->list)) {
@@ -183,9 +184,33 @@ nvkm_cstate_prog(struct nvkm_clk *clk, struct nvkm_pstate *pstate, int cstatei)
 		}
 	}
 
+	/* The voltage follows the engine clocks while memory stays at the
+	 * highest level's clock.  NvW520HoldVolt=1 keeps the highest
+	 * level's voltage instead.  By default every level runs at the
+	 * lowest level's voltage, below what the VBIOS asks for at the
+	 * higher clocks; NvW520LowVolt=0 gives each level its own.
+	 */
+	volt_id = cstate->voltage;
+	volt_min = pstate->base.voltage;
+	if (clk->pwrsrc_levels &&
+	    nvkm_boolopt(device->cfgopt, "NvW520LowVolt", true)) {
+		struct nvkm_pstate *low =
+			list_first_entry(&clk->states, typeof(*low), head);
+
+		volt_id = volt_min = low->base.voltage;
+		nvkm_info(subdev, "W520 level %02x at the voltage of level %02x (id %02x)\n",
+			  pstate->pstate, low->pstate, volt_id);
+	} else
+	if (clk->pwrsrc_levels &&
+	    nvkm_boolopt(device->cfgopt, "NvW520HoldVolt", false)) {
+		struct nvkm_pstate *top =
+			list_last_entry(&clk->states, typeof(*top), head);
+
+		volt_id = volt_min = top->base.voltage;
+	}
+
 	if (volt) {
-		ret = nvkm_volt_set_id(volt, cstate->voltage,
-				       pstate->base.voltage, clk->temp, +1);
+		ret = nvkm_volt_set_id(volt, volt_id, volt_min, clk->temp, +1);
 		if (ret && ret != -ENODEV) {
 			nvkm_error(subdev, "failed to raise voltage: %d\n", ret);
 			return ret;
@@ -199,8 +224,8 @@ nvkm_cstate_prog(struct nvkm_clk *clk, struct nvkm_pstate *pstate, int cstatei)
 	}
 
 	if (volt) {
-		int err = nvkm_volt_set_id(volt, cstate->voltage,
-					   pstate->base.voltage, clk->temp, -1);
+		int err = nvkm_volt_set_id(volt, volt_id, volt_min,
+					   clk->temp, -1);
 
 		if (err && err != -ENODEV)
 			nvkm_error(subdev, "failed to lower voltage: %d\n", err);
@@ -266,10 +291,38 @@ nvkm_cstate_new(struct nvkm_clk *clk, int idx, struct nvkm_pstate *pstate)
  * P-States
  *****************************************************************************/
 static int
+nvkm_pstate_prog_mem(struct nvkm_clk *clk, struct nvkm_pstate *pstate)
+{
+	struct nvkm_fb *fb = clk->subdev.device->fb;
+	int ret = 0;
+
+	if (fb && fb->ram && fb->ram->func->calc) {
+		struct nvkm_ram *ram = fb->ram;
+		int khz = pstate->base.domain[nv_clk_src_mem];
+
+		if (clk->pwrsrc_levels) {
+			int cur = nvkm_clk_read(clk, nv_clk_src_mem);
+
+			if (cur > 0 && abs(cur - khz) <= khz / 100)
+				return 0;
+		}
+
+		ram->source = pstate->base.source[nv_clk_src_mem];
+		do {
+			ret = ram->func->calc(ram, khz);
+			if (ret == 0)
+				ret = ram->func->prog(ram);
+		} while (ret > 0);
+		ram->func->tidy(ram);
+	}
+
+	return ret;
+}
+
+static int
 nvkm_pstate_prog(struct nvkm_clk *clk, int pstatei)
 {
 	struct nvkm_subdev *subdev = &clk->subdev;
-	struct nvkm_fb *fb = subdev->device->fb;
 	struct nvkm_pci *pci = subdev->device->pci;
 	struct nvkm_pstate *pstate;
 	bool found = false;
@@ -286,20 +339,37 @@ nvkm_pstate_prog(struct nvkm_clk *clk, int pstatei)
 		return -EINVAL;
 
 	nvkm_debug(subdev, "setting performance state %d\n", pstatei);
+
+	if (clk->core_first) {
+		struct nvkm_pstate *mem = pstate;
+		bool up;
+
+		if (clk->pwrsrc_levels)
+			mem = list_last_entry(&clk->states, typeof(*mem), head);
+		up = mem->base.domain[nv_clk_src_mem] >=
+		     nvkm_clk_read(clk, nv_clk_src_mem);
+
+		clk->pstate = pstatei;
+		nvkm_pcie_set_link(pci, pstate->pcie_speed, pstate->pcie_width);
+
+		if (up) {
+			ret = nvkm_cstate_prog(clk, pstate, NVKM_CLK_CSTATE_HIGHEST);
+			if (ret == 0)
+				ret = nvkm_pstate_prog_mem(clk, mem);
+		} else {
+			ret = nvkm_pstate_prog_mem(clk, mem);
+			if (ret == 0)
+				ret = nvkm_cstate_prog(clk, pstate, NVKM_CLK_CSTATE_HIGHEST);
+		}
+
+		return ret;
+	}
+
 	clk->pstate = pstatei;
 
 	nvkm_pcie_set_link(pci, pstate->pcie_speed, pstate->pcie_width);
 
-	if (fb && fb->ram && fb->ram->func->calc) {
-		struct nvkm_ram *ram = fb->ram;
-		int khz = pstate->base.domain[nv_clk_src_mem];
-		do {
-			ret = ram->func->calc(ram, khz);
-			if (ret == 0)
-				ret = ram->func->prog(ram);
-		} while (ret > 0);
-		ram->func->tidy(ram);
-	}
+	nvkm_pstate_prog_mem(clk, pstate);
 
 	return nvkm_cstate_prog(clk, pstate, NVKM_CLK_CSTATE_HIGHEST);
 }
@@ -458,6 +528,7 @@ nvkm_pstate_new(struct nvkm_clk *clk, int idx)
 		}
 
 		cstate->domain[domain->name] = perfS.v40.freq;
+		cstate->source[domain->name] = perfS.v40.flags;
 	}
 
 	data = nvbios_cstepEm(bios, pstate->pstate, &ver, &hdr, &cstepE);
@@ -696,6 +767,12 @@ nvkm_clk_ctor(const struct nvkm_clk_func *func, struct nvkm_device *device,
 		for (idx = 0; idx < func->nr_pstates; idx++)
 			list_add_tail(&func->pstates[idx].head, &clk->states);
 		clk->state_nr = func->nr_pstates;
+	}
+
+	/* Highest level on mains, the one below it on battery. */
+	if (clk->pwrsrc_levels && clk->state_nr) {
+		clk->ustate_ac = clk->state_nr - 1;
+		clk->ustate_dc = max(clk->state_nr - 2, 0);
 	}
 
 	mode = nvkm_stropt(device->cfgopt, "NvClkMode", &arglen);

@@ -55,6 +55,7 @@ nvkm-y += nvkm/subdev/fb/ramnv50.o
 nvkm-y += nvkm/subdev/fb/ramgt215.o
 nvkm-y += nvkm/subdev/fb/rammcp77.o
 nvkm-y += nvkm/subdev/fb/ramgf100.o
+nvkm-y += nvkm/subdev/fb/ramw520.o
 nvkm-y += nvkm/subdev/fb/ramgf108.o
 nvkm-y += nvkm/subdev/fb/ramgk104.o
 nvkm-y += nvkm/subdev/fb/ramgm107.o

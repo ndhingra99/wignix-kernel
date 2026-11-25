@@ -26,6 +26,7 @@
 #include "ramfuc.h"
 
 #include <core/option.h>
+#include <core/w520.h>
 #include <subdev/bios.h>
 #include <subdev/bios/pll.h>
 #include <subdev/bios/rammap.h>
@@ -101,6 +102,7 @@ struct gf100_ram {
 	struct gf100_ramfuc fuc;
 	struct nvbios_pll refpll;
 	struct nvbios_pll mempll;
+	struct w520_ram *w520;
 };
 
 static void
@@ -142,6 +144,9 @@ gf100_ram_calc(struct nvkm_ram *base, u32 freq)
 	int from, mode;
 	int N1, M1, P;
 	int ret;
+
+	if (ram->w520)
+		return w520_ram_calc(ram->w520, freq, ram->base.source);
 
 	/* lookup memory config data relevant to the target frequency */
 	rammap.data = nvbios_rammapEm(bios, freq / 1000, &ver, &rammap.size,
@@ -408,6 +413,10 @@ gf100_ram_prog(struct nvkm_ram *base)
 {
 	struct gf100_ram *ram = gf100_ram(base);
 	struct nvkm_device *device = ram->base.fb->subdev.device;
+
+	if (ram->w520)
+		return w520_ram_prog(ram->w520);
+
 	ram_exec(&ram->fuc, nvkm_boolopt(device->cfgopt, "NvMemExec", true));
 	return 0;
 }
@@ -416,6 +425,12 @@ void
 gf100_ram_tidy(struct nvkm_ram *base)
 {
 	struct gf100_ram *ram = gf100_ram(base);
+
+	if (ram->w520) {
+		w520_ram_tidy(ram->w520);
+		return;
+	}
+
 	ram_exec(&ram->fuc, false);
 }
 
@@ -650,6 +665,14 @@ gf100_ram_new_(const struct nvkm_ram_func *func,
 	ram->fuc.r_0x611200 = ramfuc_reg(0x611200);
 
 	ram->fuc.r_0x13d8f4 = ramfuc_reg(0x13d8f4);
+
+	/* Without usable tables the memory clock is left alone and only
+	 * the engine clocks switch.
+	 */
+	if (nvkm_w520(subdev->device) &&
+	    w520_ram_new(&ram->base, &ram->refpll, &ram->mempll, &ram->w520))
+		ram->w520 = NULL;
+
 	return 0;
 }
 

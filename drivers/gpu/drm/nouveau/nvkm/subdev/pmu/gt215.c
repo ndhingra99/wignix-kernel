@@ -24,6 +24,7 @@
 #include "priv.h"
 #include "fuc/gt215.fuc3.h"
 
+#include <core/w520.h>
 #include <subdev/timer.h>
 
 int
@@ -74,7 +75,22 @@ gt215_pmu_send(struct nvkm_pmu *pmu, u32 reply[2],
 
 	/* wait for reply, if requested */
 	if (reply) {
-		wait_event(pmu->recv.wait, (pmu->recv.process == 0));
+		if (nvkm_w520(device)) {
+			/* A PMU that does not answer fails the request
+			 * instead of blocking the caller for good.
+			 */
+			if (!wait_event_timeout(pmu->recv.wait,
+						(pmu->recv.process == 0),
+						2 * HZ)) {
+				nvkm_error(subdev, "no reply to %08x/%08x\n",
+					   process, message);
+				pmu->recv.process = 0;
+				mutex_unlock(&pmu->send.mutex);
+				return -ETIMEDOUT;
+			}
+		} else {
+			wait_event(pmu->recv.wait, (pmu->recv.process == 0));
+		}
 		reply[0] = pmu->recv.data[0];
 		reply[1] = pmu->recv.data[1];
 	}

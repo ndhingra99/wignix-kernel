@@ -788,7 +788,13 @@ cmd_exec:
    xbit $r15 $r3 0
    bra e #cmd_exec_no_format
       call #cmd_exec_set_format
+#ifdef GT215
       mov $r4 0x200
+#else
+      // bit 10 makes the engine use the address high bytes in
+      // SRC_CFG/DST_CFG; without it addresses above 4GiB lose them
+      mov $r4 0x600
+#endif
       bra #cmd_exec_init_src_surface
    cmd_exec_no_format:
       mov $r6 0x810
