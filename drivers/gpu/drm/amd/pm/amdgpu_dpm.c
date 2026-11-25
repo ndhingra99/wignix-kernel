@@ -576,7 +576,7 @@ void amdgpu_dpm_compute_clocks(struct amdgpu_device *adev)
 	if (!pp_funcs->pm_compute_clocks)
 		return;
 
-	if (adev->mode_info.num_crtc)
+	if (adev->mode_info.num_crtc && adev->mode_info.funcs)
 		amdgpu_display_bandwidth_update(adev);
 
 	for (i = 0; i < AMDGPU_MAX_RINGS; i++) {
