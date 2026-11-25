@@ -1153,7 +1153,7 @@ static int __conf_write_autoconf(const char *filename,
 		return -1;
 	}
 
-	conf_write_heading(file, comment_style);
+	// conf_write_heading(file, comment_style);
 
 	for_all_symbols(sym)
 		if ((sym->flags & SYMBOL_WRITE) && sym->name)
