@@ -1,10 +1,7 @@
 # wignix-kernel
 
-A Linux kernel for the WigNix Sandy Bridge build, with the GPU and audio
-work for its two machines: the ThinkPad W520 (Quadro 2000M on nouveau)
-and the Mac Pro 6,1 (FirePro on amdgpu).
-
-Based on **Linux 7.3.6**. The commits on top are:
+The WigNix Kernel for the ThinkPad W520 and MacPro 2013 specifically.
+Based on Linux 7.3.x . Notable commits on top are:
 
 ## nouveau / W520 (Fermi)
 
